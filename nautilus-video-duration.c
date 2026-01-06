@@ -70,7 +70,7 @@ typedef struct {
 } VdSemaphore;
 
 static VdSemaphore discover_sem;
-static gint discover_max = 0;
+static gint discover_max = 5; /* ✅ 固定 5 */
 
 /* ------------------- Semaphore helpers ------------------- */
 
@@ -112,7 +112,7 @@ static void vd_semaphore_clear(VdSemaphore *s) {
 
 /* ------------------- Helpers ------------------- */
 
-static gboolean is_video_file(const gchar *name) {
+static gboolean is_media_file(const gchar *name) {
   if (!name)
     return FALSE;
   const gchar *ext = strrchr(name, '.');
@@ -120,27 +120,55 @@ static gboolean is_video_file(const gchar *name) {
     return FALSE;
   ext++;
 
-  const gchar *video_exts[] = {
-      "mp4", "mkv",  "avi",  "mov", "webm", "flv",  "wmv",  "m4v", "mpeg",
-      "mpg", "m2ts", "ts",   "3gp", "ogv",  "mp3",  "flac", "wav", "aac",
-      "m4a", "ogg",  "opus", "wma", "alac", "aiff", NULL};
+  /* 视频+音频主流格式 */
+  const gchar *media_exts[] = {/* video */
+                               "mp4", "mkv", "avi", "mov", "webm", "flv", "wmv",
+                               "m4v", "mpeg", "mpg", "m2ts", "ts", "3gp", "ogv",
+                               /* audio */
+                               "mp3", "flac", "wav", "aac", "m4a", "ogg",
+                               "opus", "wma", "alac", "aiff", NULL};
 
-  for (int i = 0; video_exts[i]; i++) {
-    if (g_ascii_strcasecmp(ext, video_exts[i]) == 0)
+  for (int i = 0; media_exts[i]; i++) {
+    if (g_ascii_strcasecmp(ext, media_exts[i]) == 0)
       return TRUE;
   }
   return FALSE;
 }
 
-static gchar *format_duration(double seconds) {
+static gboolean is_audio_file(const gchar *name) {
+  if (!name)
+    return FALSE;
+  const gchar *ext = strrchr(name, '.');
+  if (!ext)
+    return FALSE;
+  ext++;
+
+  const gchar *audio_exts[] = {"mp3",  "flac", "wav",  "aac",  "m4a", "ogg",
+                               "opus", "wma",  "alac", "aiff", NULL};
+
+  for (int i = 0; audio_exts[i]; i++) {
+    if (g_ascii_strcasecmp(ext, audio_exts[i]) == 0)
+      return TRUE;
+  }
+  return FALSE;
+}
+
+/* ✅ 音频：< 1h 显示 MM:SS；视频始终显示 H:MM:SS */
+static gchar *format_duration(double seconds, gboolean is_audio) {
   if (seconds <= 0.0)
     return g_strdup("-");
+
   int total = (int)(seconds + 0.5);
+
+  if (is_audio && total < 3600) {
+    int m = total / 60;
+    int s = total % 60;
+    return g_strdup_printf("%02d:%02d", m, s);
+  }
+
   int h = total / 3600;
   int m = (total % 3600) / 60;
   int s = total % 60;
-
-  /* ✅ 固定宽度 H:MM:SS 便于排序 */
   return g_strdup_printf("%d:%02d:%02d", h, m, s);
 }
 
@@ -159,20 +187,71 @@ static void ensure_gst_init_once(void) {
   }
 }
 
-/* timeout seconds, default 3s; override by env NAUTILUS_VD_TIMEOUT */
-static guint64 discover_timeout_ns(void) {
-  const gchar *env = g_getenv("NAUTILUS_VD_TIMEOUT");
-  if (!env || !*env)
-    return 3 * GST_SECOND;
+static const char *res_to_str(GstDiscovererResult r) {
+  switch (r) {
+  case GST_DISCOVERER_OK:
+    return "OK";
+  case GST_DISCOVERER_URI_INVALID:
+    return "URI_INVALID";
+  case GST_DISCOVERER_ERROR:
+    return "ERROR";
+  case GST_DISCOVERER_TIMEOUT:
+    return "TIMEOUT";
+  case GST_DISCOVERER_BUSY:
+    return "BUSY";
+  case GST_DISCOVERER_MISSING_PLUGINS:
+    return "MISSING_PLUGINS";
+  default:
+    return "UNKNOWN";
+  }
+}
 
-  gchar *end = NULL;
-  gint v = (gint)g_ascii_strtoll(env, &end, 10);
-  if (end == env || v <= 0)
-    return 3 * GST_SECOND;
+/* ✅ 固定：超时 5 秒 */
+static guint64 discover_timeout_ns(void) { return 5 * GST_SECOND; }
 
-  if (v > 30)
-    v = 30;
-  return (guint64)v * GST_SECOND;
+/* ✅ 固定：重试 10 秒 */
+static guint64 discover_retry_timeout_ns(void) { return 10 * GST_SECOND; }
+
+static double discover_once(const gchar *uri, guint64 timeout_ns) {
+  GError *err = NULL;
+  GstDiscoverer *dc = gst_discoverer_new(timeout_ns, &err);
+  if (!dc) {
+    g_message("VD: gst_discoverer_new failed: %s",
+              err ? err->message : "(unknown)");
+    g_clear_error(&err);
+    return 0.0;
+  }
+
+  GstDiscovererInfo *info = gst_discoverer_discover_uri(dc, uri, &err);
+  if (!info) {
+    g_message("VD: discover failed: %s (uri=%s)",
+              err ? err->message : "(unknown)", uri);
+    g_clear_error(&err);
+    g_object_unref(dc);
+    return 0.0;
+  }
+
+  GstDiscovererResult res = gst_discoverer_info_get_result(info);
+  if (res != GST_DISCOVERER_OK) {
+    const gchar *msg = (err && err->message) ? err->message : "unknown";
+    g_message("VD: discover %s(%d) err=%s (uri=%s)", res_to_str(res), (int)res,
+              msg, uri);
+    g_clear_error(&err);
+    g_object_unref(info);
+    g_object_unref(dc);
+    return 0.0;
+  }
+
+  GstClockTime dur = gst_discoverer_info_get_duration(info);
+
+  g_object_unref(info);
+  g_object_unref(dc);
+
+  if (dur == GST_CLOCK_TIME_NONE || dur == 0) {
+    return 0.0;
+  }
+
+  return (double)dur / (double)GST_SECOND;
 }
 
 static double get_duration_gst_discoverer(const gchar *path) {
@@ -185,47 +264,17 @@ static double get_duration_gst_discoverer(const gchar *path) {
   if (!uri)
     return 0.0;
 
-  GError *err = NULL;
-  GstDiscoverer *dc = gst_discoverer_new(discover_timeout_ns(), &err);
-  if (!dc) {
-    g_message("VD: gst_discoverer_new failed: %s",
-              err ? err->message : "(unknown)");
-    g_clear_error(&err);
-    g_free(uri);
-    return 0.0;
+  /* 第一次：5s */
+  double sec = discover_once(uri, discover_timeout_ns());
+
+  /* 失败：重试一次 10s */
+  if (sec <= 0.0 && !g_atomic_int_get(&shutting_down)) {
+    g_usleep(200 * 1000);
+    sec = discover_once(uri, discover_retry_timeout_ns());
   }
 
-  GstDiscovererInfo *info = gst_discoverer_discover_uri(dc, uri, &err);
-  if (!info) {
-    g_message("VD: discover failed: %s (uri=%s)",
-              err ? err->message : "(unknown)", uri);
-    g_clear_error(&err);
-    g_object_unref(dc);
-    g_free(uri);
-    return 0.0;
-  }
-
-  GstDiscovererResult res = gst_discoverer_info_get_result(info);
-  if (res != GST_DISCOVERER_OK) {
-    const gchar *msg = (err && err->message) ? err->message : "unknown";
-    g_message("VD: discover result=%d err=%s (uri=%s)", (int)res, msg, uri);
-    g_clear_error(&err);
-    g_object_unref(info);
-    g_object_unref(dc);
-    g_free(uri);
-    return 0.0;
-  }
-
-  GstClockTime dur = gst_discoverer_info_get_duration(info);
-
-  g_object_unref(info);
-  g_object_unref(dc);
   g_free(uri);
-
-  if (dur == GST_CLOCK_TIME_NONE || dur == 0)
-    return 0.0;
-
-  return (double)dur / (double)GST_SECOND;
+  return sec;
 }
 
 /* ------------------- LRU cache ------------------- */
@@ -322,7 +371,7 @@ static void job_free(Job *job) {
   g_free(job);
 }
 
-/* ------------------- Config: cache/discover limits ------------------- */
+/* ------------------- Config: cache limit ------------------- */
 
 static void init_cache_limit_from_env(void) {
   const gchar *env = g_getenv("NAUTILUS_VD_CACHE");
@@ -341,32 +390,6 @@ static void init_cache_limit_from_env(void) {
   cache_max_entries = (guint)v;
 }
 
-/* Default: min(cores,8). Env: NAUTILUS_VD_DISCOVER */
-static gint init_discover_limit_from_env(gint n_threads) {
-  gint def = n_threads;
-  if (def > 8)
-    def = 8;
-  if (def < 1)
-    def = 1;
-
-  const gchar *env = g_getenv("NAUTILUS_VD_DISCOVER");
-  if (!env || !*env)
-    return def;
-
-  gchar *end = NULL;
-  gint v = (gint)g_ascii_strtoll(env, &end, 10);
-  if (end == env)
-    return def;
-
-  if (v <= 0)
-    return n_threads;
-  if (v > n_threads)
-    v = n_threads;
-  if (v < 1)
-    v = 1;
-  return v;
-}
-
 /* ------------------- Worker ------------------- */
 
 static void worker_func(gpointer data, gpointer user_data) {
@@ -382,7 +405,12 @@ static void worker_func(gpointer data, gpointer user_data) {
   double sec = get_duration_gst_discoverer(job->path);
   vd_semaphore_release(&discover_sem);
 
-  gchar *dur = format_duration(sec);
+  /* ✅ 音频：不显示小时 */
+  gchar *base = g_path_get_basename(job->path);
+  gboolean audio = is_audio_file(base);
+  g_free(base);
+
+  gchar *dur = format_duration(sec, audio);
 
   if (g_atomic_int_get(&shutting_down)) {
     g_free(dur);
@@ -462,7 +490,7 @@ static void schedule_duration_job(NautilusFileInfo *file) {
     return;
 
   name = nautilus_file_info_get_name(file);
-  if (!is_video_file(name))
+  if (!is_media_file(name))
     goto cleanup;
 
   uri = nautilus_file_info_get_uri(file);
@@ -535,7 +563,7 @@ static GList *video_duration_get_columns(NautilusColumnProvider *provider) {
   (void)provider;
 
   NautilusColumn *col =
-      nautilus_column_new(COLUMN_ID, ATTR_KEY, "时长", "视频时长");
+      nautilus_column_new(COLUMN_ID, ATTR_KEY, "时长", "媒体时长（视频/音频）");
 
   return g_list_append(NULL, col);
 }
@@ -574,13 +602,13 @@ void nautilus_module_initialize(GTypeModule *module) {
   if (n_threads < 1)
     n_threads = 1;
 
-  discover_max = init_discover_limit_from_env(n_threads);
   vd_semaphore_init(&discover_sem, discover_max);
 
   g_message(
       "VD: threads=%d discover_max=%d cache_max=%u timeout=%" G_GUINT64_FORMAT
-      "ns",
-      n_threads, discover_max, cache_max_entries, discover_timeout_ns());
+      "ns retry=%" G_GUINT64_FORMAT "ns",
+      n_threads, discover_max, cache_max_entries, discover_timeout_ns(),
+      discover_retry_timeout_ns());
 
   pool = g_thread_pool_new(worker_func, NULL, n_threads, FALSE, NULL);
 }
