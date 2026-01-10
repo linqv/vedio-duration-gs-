@@ -31,3 +31,9 @@
 sudo pacman -S --needed \
   nautilus pkgconf gcc cmake ninja glib2 \
   gstreamer gst-plugins-base gst-plugins-good
+
+
+构建方法：
+cmake --build build -j
+sudo cmake --install build
+nautilus -q
