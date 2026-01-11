@@ -3,22 +3,31 @@
 #include <glib.h>
 #include <nautilus-extension.h>
 
-#include <gst/gst.h>
-#include <gst/pbutils/pbutils.h>
-
-#define VD_BUILD_TAG "VD_BUILD_TAG: COMPLETE-async-2026-01-10-1628-final"
+#define VD_BUILD_TAG                                                           \
+  "VD_BUILD_TAG: COMPLETE-async-ffmpeg-helperpool-noplaceholder-2026-01-11"
 
 #define COLUMN_ID "video-duration::duration"
 #define ATTR_KEY "video-duration::duration"
 
+/* Defaults */
 #define DEFAULT_CACHE_MAX_ENTRIES 512
 #define DEFAULT_QUEUE_MAX 256
 #define DEFAULT_DEBOUNCE_MS 250
 #define DEFAULT_NEGATIVE_TTL_SEC 600 /* 10 min */
 #define DEFAULT_EVICT_RATIO_PERCENT 70
-
 #define DEFAULT_DROP_NEGATIVE_TTL_MS 2000 /* drop 后短暂负缓存 */
 
+#define DEFAULT_HELPER_MAX 2
+#define DEFAULT_HELPER_REQS_BEFORE_RESTART 400
+#define DEFAULT_HELPER_TIMEOUT_MS 2000
+#define DEFAULT_HELPER_RETRY_TIMEOUT_MS 12000
+#define DEFAULT_TIMEOUT_NEG_TTL_SEC 3
+
+#ifndef VD_HELPER_PATH
+#define VD_HELPER_PATH "/usr/lib/nautilus/extensions-4/vd-ffmpeg-helper"
+#endif
+
+/* Flags */
 #define FLAG_INFLIGHT (1u << 0)
 #define FLAG_HAS_VALUE (1u << 1)
 #define FLAG_NEGATIVE (1u << 2)
@@ -43,17 +52,17 @@ G_DEFINE_DYNAMIC_TYPE_EXTENDED(
 
 /* ------------------- Cache Entry ------------------- */
 typedef struct {
-  guint64 *keyp; /* hashtable key pointer */
-  guint64 mtime; /* collision check */
-  guint64 size;  /* collision check */
+  guint64 *keyp;
+  guint64 mtime;
+  guint64 size;
 
-  guint32 seconds; /* cached duration */
+  guint32 seconds;
   guint32 flags;
 
-  gint64 negative_until_us; /* negative cache valid until */
-  gint64 last_request_us;   /* debounce */
+  gint64 negative_until_us;
+  gint64 last_request_us;
 
-  GList *lru_link; /* ✅ O(1) LRU link */
+  GList *lru_link; /* O(1) */
 } CacheEntry;
 
 /* ------------------- Job ------------------- */
@@ -79,181 +88,14 @@ static guint cache_max_entries = DEFAULT_CACHE_MAX_ENTRIES;
 static guint debounce_ms = DEFAULT_DEBOUNCE_MS;
 static guint negative_ttl_sec = DEFAULT_NEGATIVE_TTL_SEC;
 static guint evict_ratio_percent = DEFAULT_EVICT_RATIO_PERCENT;
-
 static guint drop_negative_ttl_ms = DEFAULT_DROP_NEGATIVE_TTL_MS;
 
-/* -------- GStreamer init -------- */
-static gsize gst_inited = 0;
-
-/* ------------------- Discoverer Pool (NEW) ------------------- */
-typedef struct {
-  GMutex m;
-  GCond c;
-  GQueue *free_list;  /* GstDiscoverer* */
-  gint total_created; /* total created discoverers */
-  gint capacity;      /* max discoverers */
-  guint64 timeout_ns; /* discoverer timeout */
-  gboolean inited;
-} DiscovererPool;
-
-static DiscovererPool pool_5s;
-static DiscovererPool pool_10s;
-static gint discover_max = 5;
-
-static guint64 discover_timeout_ns(void) { return 5 * GST_SECOND; }
-static guint64 discover_retry_timeout_ns(void) { return 10 * GST_SECOND; }
-
-static void ensure_gst_init_once(void) {
-  if (g_once_init_enter(&gst_inited)) {
-    gst_init(NULL, NULL);
-    g_once_init_leave(&gst_inited, 1);
-  }
-}
-
-static void discoverer_pool_init(DiscovererPool *p, gint capacity,
-                                 guint64 timeout_ns) {
-  g_mutex_init(&p->m);
-  g_cond_init(&p->c);
-  p->free_list = g_queue_new();
-  p->total_created = 0;
-  p->capacity = capacity;
-  p->timeout_ns = timeout_ns;
-  p->inited = TRUE;
-}
-
-static GstDiscoverer *discoverer_pool_acquire(DiscovererPool *p) {
-  if (!p || !p->inited)
-    return NULL;
-
-  g_mutex_lock(&p->m);
-
-  while (!g_atomic_int_get(&shutting_down)) {
-    if (!g_queue_is_empty(p->free_list)) {
-      GstDiscoverer *dc = g_queue_pop_head(p->free_list);
-      g_mutex_unlock(&p->m);
-      return dc;
-    }
-
-    if (p->total_created < p->capacity) {
-      p->total_created++;
-      g_mutex_unlock(&p->m);
-
-      GError *err = NULL;
-      GstDiscoverer *dc = gst_discoverer_new(p->timeout_ns, &err);
-      if (!dc) {
-        g_message("VD: gst_discoverer_new(%lu ns) failed: %s",
-                  (unsigned long)p->timeout_ns,
-                  err ? err->message : "(unknown)");
-        g_clear_error(&err);
-
-        /* rollback created count */
-        g_mutex_lock(&p->m);
-        p->total_created--;
-        g_mutex_unlock(&p->m);
-
-        return NULL;
-      }
-      return dc;
-    }
-
-    /* wait for release */
-    g_cond_wait(&p->c, &p->m);
-  }
-
-  g_mutex_unlock(&p->m);
-  return NULL;
-}
-
-static void discoverer_pool_release(DiscovererPool *p, GstDiscoverer *dc) {
-  if (!p || !p->inited || !dc)
-    return;
-
-  g_mutex_lock(&p->m);
-  g_queue_push_tail(p->free_list, dc);
-  g_cond_signal(&p->c);
-  g_mutex_unlock(&p->m);
-}
-
-static void discoverer_pool_clear(DiscovererPool *p) {
-  if (!p || !p->inited)
-    return;
-
-  g_mutex_lock(&p->m);
-
-  while (!g_queue_is_empty(p->free_list)) {
-    GstDiscoverer *dc = g_queue_pop_head(p->free_list);
-    if (dc)
-      g_object_unref(dc);
-  }
-
-  g_queue_free(p->free_list);
-  p->free_list = NULL;
-  p->total_created = 0;
-  p->capacity = 0;
-  p->inited = FALSE;
-
-  g_mutex_unlock(&p->m);
-
-  g_cond_clear(&p->c);
-  g_mutex_clear(&p->m);
-}
-
-static double discover_once_pool(const gchar *uri, DiscovererPool *p) {
-  GstDiscoverer *dc = discoverer_pool_acquire(p);
-  if (!dc)
-    return 0.0;
-
-  GError *err = NULL;
-  GstDiscovererInfo *info = gst_discoverer_discover_uri(dc, uri, &err);
-
-  discoverer_pool_release(p, dc);
-
-  if (!info) {
-    g_clear_error(&err);
-    return 0.0;
-  }
-
-  if (gst_discoverer_info_get_result(info) != GST_DISCOVERER_OK) {
-    g_clear_error(&err);
-    g_object_unref(info);
-    return 0.0;
-  }
-
-  GstClockTime dur = gst_discoverer_info_get_duration(info);
-  g_object_unref(info);
-
-  if (dur == GST_CLOCK_TIME_NONE || dur == 0)
-    return 0.0;
-
-  return (double)dur / (double)GST_SECOND;
-}
-
-static guint32 get_duration_seconds(const gchar *path) {
-  if (!path)
-    return 0;
-
-  ensure_gst_init_once();
-
-  gchar *uri = g_filename_to_uri(path, NULL, NULL);
-  if (!uri)
-    return 0;
-
-  double sec = discover_once_pool(uri, &pool_5s);
-
-  if (sec <= 0.0 && !g_atomic_int_get(&shutting_down)) {
-    g_usleep(200 * 1000);
-    sec = discover_once_pool(uri, &pool_10s);
-  }
-
-  g_free(uri);
-
-  if (sec <= 0.0)
-    return 0;
-  if (sec > (double)G_MAXUINT32)
-    return G_MAXUINT32;
-
-  return (guint32)(sec + 0.5);
-}
+/* Helper config */
+static guint helper_max = DEFAULT_HELPER_MAX;
+static guint helper_timeout_ms = DEFAULT_HELPER_TIMEOUT_MS;
+static guint helper_retry_timeout_ms = DEFAULT_HELPER_RETRY_TIMEOUT_MS;
+static guint timeout_negative_ttl_sec = DEFAULT_TIMEOUT_NEG_TTL_SEC;
+static guint helper_reqs_before_restart = DEFAULT_HELPER_REQS_BEFORE_RESTART;
 
 /* ------------------- Helpers ------------------- */
 static gboolean is_media_file(const gchar *name) {
@@ -301,7 +143,7 @@ static gchar *format_seconds(guint32 sec, gboolean is_audio) {
   return g_strdup_printf("%u:%02u:%02u", h, m, s);
 }
 
-/* ------------------- key(uint64) + collision check ------------------- */
+/* ------------------- key(uint64) ------------------- */
 static inline guint64 mix64(guint64 x) {
   x ^= x >> 33;
   x *= 0xff51afd7ed558ccdULL;
@@ -316,8 +158,6 @@ static guint64 make_key_u64(const gchar *path, guint64 mtime, guint64 size) {
       ((guint64)h1 << 32) ^ (mtime * 1315423911ULL) ^ (size * 2654435761ULL);
   return mix64(x);
 }
-
-/* hashtable key funcs (uint64*) */
 static guint key_u64_hash(gconstpointer p) {
   const guint64 v = *(const guint64 *)p;
   return (guint)(v ^ (v >> 32));
@@ -326,7 +166,7 @@ static gboolean key_u64_equal(gconstpointer a, gconstpointer b) {
   return (*(const guint64 *)a) == (*(const guint64 *)b);
 }
 
-/* ------------------- LRU (O(1)) ------------------- */
+/* ------------------- LRU ------------------- */
 static void lru_touch_unlocked(CacheEntry *e) {
   if (!e)
     return;
@@ -339,36 +179,24 @@ static void lru_touch_unlocked(CacheEntry *e) {
   }
 }
 
-/* entry destroy */
 static void entry_destroy(gpointer data) {
   CacheEntry *e = data;
   if (!e)
     return;
-
-#ifdef G_ENABLE_DEBUG
-  if (e->lru_link) {
-    g_warning("VD: entry_destroy called while still linked in LRU (bug)!");
-  }
-#endif
-
   e->lru_link = NULL;
   g_free(e);
 }
 
-/* unified remove (lock held) */
 static void cache_entry_remove_unlocked(CacheEntry *e) {
   if (!e)
     return;
-
   if (e->lru_link) {
     g_queue_unlink(lru, e->lru_link);
     e->lru_link = NULL;
   }
-
   g_hash_table_remove(entries, e->keyp);
 }
 
-/* improved evict: skip inflight */
 static void evict_if_needed_unlocked(void) {
   guint sz = g_hash_table_size(entries);
   if (sz <= cache_max_entries)
@@ -456,17 +284,27 @@ static void init_limits_from_env(void) {
       read_env_uint("NAUTILUS_VD_CACHE", DEFAULT_CACHE_MAX_ENTRIES, 1, 200000);
   queue_max =
       read_env_uint("NAUTILUS_VD_QUEUE_MAX", DEFAULT_QUEUE_MAX, 1, 200000);
-  discover_max = (gint)read_env_uint("NAUTILUS_VD_DISCOVER_MAX", 5, 1, 32);
   debounce_ms =
       read_env_uint("NAUTILUS_VD_DEBOUNCE_MS", DEFAULT_DEBOUNCE_MS, 0, 5000);
   negative_ttl_sec =
       read_env_uint("NAUTILUS_VD_NEG_TTL", DEFAULT_NEGATIVE_TTL_SEC, 1, 86400);
-
   evict_ratio_percent = read_env_uint("NAUTILUS_VD_EVICT_RATIO",
                                       DEFAULT_EVICT_RATIO_PERCENT, 10, 95);
-
   drop_negative_ttl_ms = read_env_uint("NAUTILUS_VD_DROP_NEG_TTL_MS",
                                        DEFAULT_DROP_NEGATIVE_TTL_MS, 0, 60000);
+
+  helper_max =
+      read_env_uint("NAUTILUS_VD_HELPER_MAX", DEFAULT_HELPER_MAX, 1, 16);
+  helper_timeout_ms = read_env_uint("NAUTILUS_VD_FF_TIMEOUT_MS",
+                                    DEFAULT_HELPER_TIMEOUT_MS, 100, 60000);
+  helper_retry_timeout_ms =
+      read_env_uint("NAUTILUS_VD_FF_RETRY_TIMEOUT_MS",
+                    DEFAULT_HELPER_RETRY_TIMEOUT_MS, 200, 180000);
+  timeout_negative_ttl_sec = read_env_uint(
+      "NAUTILUS_VD_TIMEOUT_NEG_TTL_SEC", DEFAULT_TIMEOUT_NEG_TTL_SEC, 0, 3600);
+  helper_reqs_before_restart =
+      read_env_uint("NAUTILUS_VD_HELPER_REQS_BEFORE_RESTART",
+                    DEFAULT_HELPER_REQS_BEFORE_RESTART, 50, 100000);
 }
 
 /* ------------------- Main thread update ------------------- */
@@ -512,6 +350,317 @@ static void post_update_to_main(NautilusFileInfo *file, guint32 seconds,
   g_main_context_invoke(NULL, apply_update_main, u);
 }
 
+/* ------------------- Helper Pool ------------------- */
+typedef struct {
+  GSubprocess *proc;
+  GDataInputStream *din;
+  GOutputStream *out;
+  guint req_count;
+} HelperInstance;
+
+typedef struct {
+  GMutex m;
+  GCond c;
+  GQueue *free_list; /* HelperInstance* */
+  gint total_created;
+  gint capacity;
+  gboolean inited;
+  gchar *helper_path;
+} HelperPool;
+
+static HelperPool helper_pool;
+
+static gchar *resolve_helper_path(void) {
+  const gchar *env = g_getenv("NAUTILUS_VD_HELPER");
+  if (env && *env)
+    return g_strdup(env);
+  return g_strdup(VD_HELPER_PATH);
+}
+
+static void helper_instance_destroy(HelperInstance *h) {
+  if (!h)
+    return;
+  if (h->proc)
+    g_object_unref(h->proc);
+  if (h->din)
+    g_object_unref(h->din);
+  /* out is owned by proc's stdout? Actually from get_stdin_pipe -> new ref */
+  if (h->out)
+    g_object_unref(h->out);
+  g_free(h);
+}
+
+static gboolean helper_instance_is_alive(HelperInstance *h) {
+  if (!h || !h->proc)
+    return FALSE;
+  return g_subprocess_get_if_exited(h->proc) ? FALSE : TRUE;
+}
+
+static HelperInstance *helper_instance_spawn(const gchar *helper_path) {
+  GError *err = NULL;
+
+  const gchar *argv[] = {helper_path, NULL};
+
+  GSubprocess *p = g_subprocess_newv(argv,
+                                     G_SUBPROCESS_FLAGS_STDIN_PIPE |
+                                         G_SUBPROCESS_FLAGS_STDOUT_PIPE |
+                                         G_SUBPROCESS_FLAGS_STDERR_SILENCE,
+                                     &err);
+
+  if (!p) {
+    g_message("VD: spawn helper failed: %s", err ? err->message : "(unknown)");
+    g_clear_error(&err);
+    return NULL;
+  }
+
+  GInputStream *stdout_is = g_subprocess_get_stdout_pipe(p);
+  GOutputStream *stdin_os = g_subprocess_get_stdin_pipe(p);
+
+  HelperInstance *h = g_new0(HelperInstance, 1);
+  h->proc = p;
+  h->din = g_data_input_stream_new(stdout_is);
+  h->out = g_object_ref(stdin_os);
+  h->req_count = 0;
+
+  /* line length cap to prevent runaway */
+  g_data_input_stream_set_newline_type(h->din, G_DATA_STREAM_NEWLINE_TYPE_LF);
+
+  return h;
+}
+
+static void helper_pool_init(HelperPool *p, gint capacity) {
+  g_mutex_init(&p->m);
+  g_cond_init(&p->c);
+  p->free_list = g_queue_new();
+  p->total_created = 0;
+  p->capacity = capacity;
+  p->inited = TRUE;
+  p->helper_path = resolve_helper_path();
+}
+
+static void helper_pool_wake_all(HelperPool *p) {
+  if (!p || !p->inited)
+    return;
+  g_mutex_lock(&p->m);
+  g_cond_broadcast(&p->c);
+  g_mutex_unlock(&p->m);
+}
+
+static void helper_pool_clear(HelperPool *p) {
+  if (!p || !p->inited)
+    return;
+
+  g_mutex_lock(&p->m);
+  while (!g_queue_is_empty(p->free_list)) {
+    HelperInstance *h = g_queue_pop_head(p->free_list);
+    helper_instance_destroy(h);
+  }
+  g_queue_free(p->free_list);
+  p->free_list = NULL;
+  p->total_created = 0;
+  p->capacity = 0;
+  p->inited = FALSE;
+  g_mutex_unlock(&p->m);
+
+  g_free(p->helper_path);
+
+  g_cond_clear(&p->c);
+  g_mutex_clear(&p->m);
+}
+
+static HelperInstance *helper_pool_acquire(HelperPool *p) {
+  if (!p || !p->inited)
+    return NULL;
+
+  g_mutex_lock(&p->m);
+  while (!g_atomic_int_get(&shutting_down)) {
+    if (!g_queue_is_empty(p->free_list)) {
+      HelperInstance *h = g_queue_pop_head(p->free_list);
+      g_mutex_unlock(&p->m);
+      return h;
+    }
+
+    if (p->total_created < p->capacity) {
+      p->total_created++;
+      gchar *hp = g_strdup(p->helper_path);
+      g_mutex_unlock(&p->m);
+
+      HelperInstance *h = helper_instance_spawn(hp);
+      g_free(hp);
+
+      if (!h) {
+        g_mutex_lock(&p->m);
+        p->total_created--;
+        g_mutex_unlock(&p->m);
+        return NULL;
+      }
+      return h;
+    }
+
+    g_cond_wait(&p->c, &p->m);
+  }
+  g_mutex_unlock(&p->m);
+  return NULL;
+}
+
+static void helper_pool_release(HelperPool *p, HelperInstance *h) {
+  if (!p || !p->inited || !h)
+    return;
+
+  g_mutex_lock(&p->m);
+  g_queue_push_tail(p->free_list, h);
+  g_cond_signal(&p->c);
+  g_mutex_unlock(&p->m);
+}
+
+static guint32 parse_ok_line_seconds(const gchar *line) {
+  if (!line)
+    return 0;
+  /* expected: "OK <sec>" or "OK 0" */
+  if (g_str_has_prefix(line, "OK")) {
+    const gchar *p = line + 2;
+    while (*p == ' ' || *p == '\t')
+      p++;
+    if (!*p)
+      return 0;
+    guint64 v = g_ascii_strtoull(p, NULL, 10);
+    if (v > G_MAXUINT32)
+      return G_MAXUINT32;
+    return (guint32)v;
+  }
+  return 0;
+}
+
+typedef struct {
+  guint32 seconds;
+  gboolean timed_out;
+} DurationResult;
+
+/* One request to helper. Protocol:
+ *   REQ <timeout_ms> <retry_timeout_ms> <b64(path)>\n
+ *   -> OK <seconds>\n
+ * If helper detects timeout in pass1 and pass2, it still replies OK 0.
+ * We mark timed_out if we receive "OK 0" AND helper also prints "TO"?
+ * To keep protocol simple, helper will output "OK <sec> <flags>" where flags
+ * include 'T' if timed out. We'll parse it.
+ */
+static DurationResult helper_request_duration(HelperInstance *h,
+                                              const gchar *path) {
+  DurationResult r = {0, FALSE};
+  if (!h || !path)
+    return r;
+
+  /* base64 encode path (safe line protocol) */
+  gchar *b64 = g_base64_encode((const guchar *)path, (gsize)strlen(path));
+  gchar *line = g_strdup_printf("REQ %u %u %s\n", helper_timeout_ms,
+                                helper_retry_timeout_ms, b64);
+  g_free(b64);
+
+  GError *err = NULL;
+  gsize written = 0;
+  gboolean ok = g_output_stream_write_all(h->out, line, strlen(line), &written,
+                                          NULL, &err);
+  g_free(line);
+
+  if (!ok) {
+    g_clear_error(&err);
+    return r;
+  }
+  ok = g_output_stream_flush(h->out, NULL, &err);
+  if (!ok) {
+    g_clear_error(&err);
+    return r;
+  }
+
+  /* Read one line response */
+  gsize len = 0;
+  gchar *resp = g_data_input_stream_read_line(h->din, &len, NULL, &err);
+  if (!resp) {
+    g_clear_error(&err);
+    return r;
+  }
+
+  /* expected: "OK <sec> <flags>" */
+  /* flags: may contain 'T' if timed out happened (even if sec==0) */
+  if (g_str_has_prefix(resp, "OK")) {
+    gchar **parts = g_strsplit(resp, " ", 0);
+    if (parts && parts[1]) {
+      guint64 v = g_ascii_strtoull(parts[1], NULL, 10);
+      if (v > G_MAXUINT32)
+        v = G_MAXUINT32;
+      r.seconds = (guint32)v;
+    }
+    if (parts && parts[2]) {
+      if (strchr(parts[2], 'T'))
+        r.timed_out = TRUE;
+    }
+    g_strfreev(parts);
+  }
+
+  g_free(resp);
+
+  return r;
+}
+
+static void helper_instance_maybe_restart(HelperPool *p, HelperInstance *h) {
+  if (!h)
+    return;
+
+  if (!helper_instance_is_alive(h)) {
+    helper_instance_destroy(h);
+    /* total_created stays same; we will spawn again on next acquire */
+    g_mutex_lock(&p->m);
+    p->total_created--;
+    g_mutex_unlock(&p->m);
+    return;
+  }
+
+  h->req_count++;
+  if (h->req_count >= helper_reqs_before_restart) {
+    /* graceful request: send QUIT */
+    GError *err = NULL;
+    const gchar *q = "QUIT\n";
+    g_output_stream_write_all(h->out, q, strlen(q), NULL, NULL, &err);
+    g_clear_error(&err);
+    g_output_stream_flush(h->out, NULL, NULL);
+
+    helper_instance_destroy(h);
+    g_mutex_lock(&p->m);
+    p->total_created--;
+    g_mutex_unlock(&p->m);
+  }
+}
+
+/* Wrapper that uses helper pool */
+static DurationResult get_duration_seconds_via_helper(const gchar *path) {
+  DurationResult r = {0, FALSE};
+  if (!path)
+    return r;
+
+  HelperInstance *h = helper_pool_acquire(&helper_pool);
+  if (!h)
+    return r;
+
+  r = helper_request_duration(h, path);
+
+  /* if helper broken, drop it; else return to pool */
+  if (!helper_instance_is_alive(h)) {
+    helper_instance_destroy(h);
+    g_mutex_lock(&helper_pool.m);
+    helper_pool.total_created--;
+    g_mutex_unlock(&helper_pool.m);
+  } else {
+    /* optional: periodic restart to cap helper memory */
+    helper_instance_maybe_restart(&helper_pool, h);
+    /* If it was destroyed in maybe_restart, don't release */
+    if (helper_instance_is_alive(h)) {
+      helper_pool_release(&helper_pool, h);
+    }
+  }
+
+  return r;
+}
+
 /* ------------------- Job / Worker ------------------- */
 static void job_free(Job *job) {
   if (!job)
@@ -530,8 +679,10 @@ static void worker_process(Job *job) {
     return;
   }
 
-  guint32 seconds = get_duration_seconds(job->path);
+  DurationResult dr = get_duration_seconds_via_helper(job->path);
+  guint32 seconds = dr.seconds;
   gboolean negative = (seconds == 0);
+  gboolean timeout_fail = (seconds == 0 && dr.timed_out);
 
   gchar *base = g_path_get_basename(job->path);
   gboolean audio = is_audio_ext(base);
@@ -556,7 +707,16 @@ static void worker_process(Job *job) {
       e->flags &= ~FLAG_HAS_VALUE;
       e->flags |= FLAG_NEGATIVE;
       e->seconds = 0;
-      e->negative_until_us = now_us + (gint64)negative_ttl_sec * G_USEC_PER_SEC;
+
+      /* HDD-friendly: timeout failure -> short negative TTL */
+      guint ttl = negative_ttl_sec;
+      if (timeout_fail)
+        ttl = timeout_negative_ttl_sec;
+
+      if (ttl == 0)
+        e->negative_until_us = now_us;
+      else
+        e->negative_until_us = now_us + (gint64)ttl * G_USEC_PER_SEC;
     }
 
     lru_touch_unlocked(e);
@@ -709,7 +869,7 @@ static void schedule_duration_job(NautilusFileInfo *file) {
 
   e->flags |= FLAG_INFLIGHT;
 
-  nautilus_file_info_add_string_attribute(file, ATTR_KEY, "…");
+  /* ✅ no placeholder */
 
   if (!(e->flags & FLAG_QUEUED)) {
     e->flags |= FLAG_QUEUED;
@@ -803,28 +963,26 @@ void nautilus_module_initialize(GTypeModule *module) {
   lru = g_queue_new();
   pending = g_queue_new();
 
-  /* ✅ Discoverer pool init: capacity = discover_max */
-  ensure_gst_init_once();
-  discoverer_pool_init(&pool_5s, discover_max, discover_timeout_ns());
-  discoverer_pool_init(&pool_10s, discover_max, discover_retry_timeout_ns());
+  helper_pool_init(&helper_pool, (gint)helper_max);
 
-  /* ✅ cap default threads */
+  /* threads default: <= 8 */
   gint n_threads = (gint)g_get_num_processors();
   if (n_threads < 1)
     n_threads = 1;
-  gint capped = n_threads;
-  if (capped > 8)
-    capped = 8;
+  gint capped = n_threads > 8 ? 8 : n_threads;
 
   worker_count =
       (gint)read_env_uint("NAUTILUS_VD_THREADS", (guint)capped, 1, 128);
 
-  g_message("VD: COMPLETE-async threads=%d discover_max=%d cache_max=%u "
-            "queue_max=%u debounce_ms=%u neg_ttl=%u evict_ratio=%u "
-            "drop_neg_ttl_ms=%u",
-            worker_count, discover_max, cache_max_entries, queue_max,
-            debounce_ms, negative_ttl_sec, evict_ratio_percent,
-            drop_negative_ttl_ms);
+  g_message("VD: helperpool threads=%d helper_max=%u cache_max=%u queue_max=%u "
+            "debounce_ms=%u neg_ttl=%u evict_ratio=%u drop_neg_ttl_ms=%u "
+            "ff_timeout=%u ff_retry=%u timeout_neg_ttl=%u "
+            "helper_reqs_restart=%u helper_path=%s",
+            worker_count, helper_max, cache_max_entries, queue_max, debounce_ms,
+            negative_ttl_sec, evict_ratio_percent, drop_negative_ttl_ms,
+            helper_timeout_ms, helper_retry_timeout_ms,
+            timeout_negative_ttl_sec, helper_reqs_before_restart,
+            helper_pool.helper_path);
 
   workers = g_new0(GThread *, worker_count);
   for (gint i = 0; i < worker_count; i++)
@@ -839,17 +997,8 @@ void nautilus_module_shutdown(void) {
   g_cond_broadcast(&pending_cond);
   g_mutex_unlock(&lock);
 
-  /* wake discoverer pool waiters */
-  if (pool_5s.inited) {
-    g_mutex_lock(&pool_5s.m);
-    g_cond_broadcast(&pool_5s.c);
-    g_mutex_unlock(&pool_5s.m);
-  }
-  if (pool_10s.inited) {
-    g_mutex_lock(&pool_10s.m);
-    g_cond_broadcast(&pool_10s.c);
-    g_mutex_unlock(&pool_10s.m);
-  }
+  /* wake helper pool waiters */
+  helper_pool_wake_all(&helper_pool);
 
   if (workers) {
     for (gint i = 0; i < worker_count; i++)
@@ -883,9 +1032,7 @@ void nautilus_module_shutdown(void) {
 
   g_mutex_unlock(&lock);
 
-  /* ✅ clear pools (unref all discoverers) */
-  discoverer_pool_clear(&pool_5s);
-  discoverer_pool_clear(&pool_10s);
+  helper_pool_clear(&helper_pool);
 
   g_cond_clear(&pending_cond);
   g_mutex_clear(&lock);

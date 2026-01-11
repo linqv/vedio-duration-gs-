@@ -4,7 +4,6 @@ project(nautilus_video_duration C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# 编译选项
 add_compile_options(-Wall -Wextra -O2 -fPIC)
 
 find_package(PkgConfig REQUIRED)
@@ -14,10 +13,11 @@ pkg_check_modules(GLIB REQUIRED glib-2.0)
 pkg_check_modules(GIO REQUIRED gio-2.0)
 pkg_check_modules(GMODULE REQUIRED gmodule-2.0)
 
-# ✅ GStreamer + Discoverer(Pbutils)
-pkg_check_modules(GST REQUIRED gstreamer-1.0)
-pkg_check_modules(GSTPB REQUIRED gstreamer-pbutils-1.0)
+# Helper uses FFmpeg libs
+pkg_check_modules(AVFORMAT REQUIRED libavformat)
+pkg_check_modules(AVUTIL REQUIRED libavutil)
 
+# ---- Nautilus extension (NO ffmpeg link here) ----
 add_library(nautilus-video-duration SHARED nautilus-video-duration.c)
 
 target_include_directories(nautilus-video-duration PRIVATE
@@ -25,8 +25,6 @@ target_include_directories(nautilus-video-duration PRIVATE
     ${GLIB_INCLUDE_DIRS}
     ${GIO_INCLUDE_DIRS}
     ${GMODULE_INCLUDE_DIRS}
-    ${GST_INCLUDE_DIRS}
-    ${GSTPB_INCLUDE_DIRS}
 )
 
 target_compile_options(nautilus-video-duration PRIVATE
@@ -34,8 +32,6 @@ target_compile_options(nautilus-video-duration PRIVATE
     ${GLIB_CFLAGS_OTHER}
     ${GIO_CFLAGS_OTHER}
     ${GMODULE_CFLAGS_OTHER}
-    ${GST_CFLAGS_OTHER}
-    ${GSTPB_CFLAGS_OTHER}
 )
 
 target_link_libraries(nautilus-video-duration
@@ -43,17 +39,32 @@ target_link_libraries(nautilus-video-duration
     ${GLIB_LIBRARIES}
     ${GIO_LIBRARIES}
     ${GMODULE_LIBRARIES}
-    ${GST_LIBRARIES}
-    ${GSTPB_LIBRARIES}
 )
 
-# 输出文件名：nautilus-video-duration.so
 set_target_properties(nautilus-video-duration PROPERTIES
     PREFIX ""
     OUTPUT_NAME "nautilus-video-duration"
 )
 
-# 目标安装目录：固定到 Nautilus 4 扩展目录
+# ---- Helper executable ----
+add_executable(vd-ffmpeg-helper vd-ffmpeg-helper.c)
+
+target_include_directories(vd-ffmpeg-helper PRIVATE
+    ${AVFORMAT_INCLUDE_DIRS}
+    ${AVUTIL_INCLUDE_DIRS}
+)
+
+target_compile_options(vd-ffmpeg-helper PRIVATE
+    ${AVFORMAT_CFLAGS_OTHER}
+    ${AVUTIL_CFLAGS_OTHER}
+)
+
+target_link_libraries(vd-ffmpeg-helper
+    ${AVFORMAT_LIBRARIES}
+    ${AVUTIL_LIBRARIES}
+)
+
+# Install paths
 set(NAUTILUS_EXT_DIR "/usr/lib/nautilus/extensions-4" CACHE PATH
     "Nautilus extensions-4 directory"
 )
@@ -62,4 +73,9 @@ message(STATUS "Install Nautilus extension to: ${NAUTILUS_EXT_DIR}")
 
 install(TARGETS nautilus-video-duration
     LIBRARY DESTINATION ${NAUTILUS_EXT_DIR}
+)
+
+# Install helper next to extension by default
+install(TARGETS vd-ffmpeg-helper
+    RUNTIME DESTINATION ${NAUTILUS_EXT_DIR}
 )
